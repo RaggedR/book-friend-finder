@@ -70,16 +70,6 @@
             margin-top: 5px;
         }
 
-        .cluster-info {
-            background: linear-gradient(135deg, #667eea20 0%, #764ba220 100%);
-            border-radius: 10px;
-            padding: 15px;
-            margin-top: 15px;
-            text-align: center;
-            font-size: 1.1em;
-            color: #333;
-        }
-
         .matches {
             margin-top: 20px;
         }
@@ -280,7 +270,9 @@
 <body>
     <div class="container">
         <div class="header">
-            <h1><span class="emoji">🎯</span> Book Friends for {{ user.name }}</h1>
+            <h1><span class="emoji">🎯</span> Book Friends for <a href="https://hardcover.app/@{{ user.username }}" target="_blank" style="color: #667eea; text-decoration: none;">{{ user.name }}</a>
+                <a href="https://hardcover.app/@{{ user.username }}" target="_blank" style="font-size: 0.5em; color: #888; margin-left: 8px;">@{{ user.username }} ↗</a>
+            </h1>
 
             <div class="user-info">
                 <strong>Your Reading Profile:</strong>
@@ -300,12 +292,6 @@
                     </div>
                 </div>
 
-                <div class="cluster-info">
-                    <a href="/cluster/{{ cluster_id }}?user_id={{ user.id }}" style="color: #667eea; text-decoration: none; font-weight: bold;">
-                        {{ cluster_name }} →
-                    </a><br>
-                    <span style="color: #666;">{{ cluster_size }} readers in your group - click to see all</span>
-                </div>
             </div>
 
             <a href="/" class="back-button">← Find Friends for Someone Else</a>
@@ -342,13 +328,13 @@
 
                 <div class="match-stats">
                     <span>📚 <strong>{{ match.num_read }}</strong> books read</span>
-                    <span>🤝 <strong>{{ match.shared_books|length }}</strong> books in common</span>
+                    <span>🤝 <strong>{{ match.shared_books_total or match.shared_books|length }}</strong> books in common</span>
                     <a href="/chat/{{ match.user_id }}?user_id={{ user.id }}" class="chat-button">💬 Chat</a>
                 </div>
 
                 {% if match.shared_books %}
                 <div class="shared-books">
-                    <div class="section-title">Shared Favorite Books:</div>
+                    <div class="section-title">{% if match.shared_books_total and match.shared_books_total > 10 %}{{ match.shared_books_total }} Shared Books (showing rarest):{% else %}Shared Favorite Books:{% endif %}</div>
                     <div class="book-list">
                         {% for book in match.shared_books[:10] %}
                         <div class="book-item">{% if book is mapping %}{{ book.title }}<a href="https://hardcover.app/books/{{ book.slug }}" target="_blank" class="book-link" title="View on Hardcover"></a>{% else %}{{ book }}{% endif %}</div>

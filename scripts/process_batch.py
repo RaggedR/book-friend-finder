@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+import sqlite3
 from datetime import datetime, UTC
 from collections import defaultdict
 import requests
@@ -25,8 +26,7 @@ load_dotenv()
 API_ENDPOINT = "https://api.hardcover.app/v1/graphql"
 API_TOKEN = os.getenv("HARDCOVER_API_TOKEN", "YOUR_API_TOKEN_HERE")
 USERS_FILE = os.path.expanduser("~/data/hardcover/users.json")
-USER_BOOKS_FILE = os.path.expanduser("~/data/hardcover/user_books.json")
-BOOKS_USERS_FILE = os.path.expanduser("~/data/hardcover/books_users.json")
+BOOKS_USERS_DB = os.path.expanduser("~/data/hardcover/books_users.db")
 PROGRESS_FILE = os.path.expanduser("~/git/hardcover-live/progress.json")
 BATCH_SIZE = 25
 REQUEST_DELAY = 1.0
@@ -36,21 +36,34 @@ def load_progress():
     """Load progress file."""
     try:
         with open(PROGRESS_FILE, 'r') as f:
-            return json.load(f)
+            progress = json.load(f)
+            # Ensure new fields exist
+            if 'seen_user_ids' not in progress:
+                progress['seen_user_ids'] = []
+            if 'cursor_created_before' not in progress:
+                progress['cursor_created_before'] = None
+            # Convert to set for O(1) lookup
+            progress['seen_user_ids_set'] = set(progress['seen_user_ids'])
+            return progress
     except FileNotFoundError:
         return {
             "batches_processed": 0,
             "total_users": 0,
             "total_books": 0,
-            "last_updated": None
+            "last_updated": None,
+            "seen_user_ids": [],
+            "seen_user_ids_set": set(),
+            "cursor_created_before": None
         }
 
 
 def save_progress(progress):
     """Save progress file."""
     progress["last_updated"] = datetime.now(UTC).isoformat()
+    # Remove the set before saving (not JSON serializable)
+    save_data = {k: v for k, v in progress.items() if k != 'seen_user_ids_set'}
     with open(PROGRESS_FILE, 'w') as f:
-        json.dump(progress, f, indent=2)
+        json.dump(save_data, f, indent=2)
 
 
 def load_json_file(filepath, default):
@@ -72,25 +85,74 @@ def save_json_file(filepath, data):
 # PHASE 1: Download 25 users
 # ============================================================================
 
-def fetch_users(offset):
-    """Fetch 25 users from API."""
-    query = """
-    query GetUsers($limit: Int!, $offset: Int!) {
-      users(limit: $limit, offset: $offset, order_by: {created_at: desc}) {
-        id
-        name
-        username
-        bio
-        image { url }
-        created_at
-        updated_at
-      }
-    }
+MIN_BOOKS_FILTER = 20  # Only fetch detailed books for users with at least this many
+
+
+def fetch_users(cursor_created_before=None):
+    """Fetch 25 users from API using cursor-based pagination.
+
+    Args:
+        cursor_created_before: ISO timestamp. Fetch users created before this time.
+                              If None, fetches the newest users.
+
+    Only fetches users who have at least 1 book (skips empty accounts).
+    Returns book count so we can filter for MIN_BOOKS_FILTER in Phase 2.
     """
+    if cursor_created_before:
+        # Cursor-based: get users created before the cursor, who have at least 1 book
+        query = """
+        query GetUsers($limit: Int!, $cursor: timestamptz!) {
+          users(
+            limit: $limit,
+            where: {
+              created_at: {_lt: $cursor},
+              user_books: {}
+            },
+            order_by: {created_at: desc}
+          ) {
+            id
+            name
+            username
+            bio
+            image { url }
+            created_at
+            updated_at
+            user_books_aggregate {
+              aggregate { count }
+            }
+          }
+        }
+        """
+        variables = {"limit": BATCH_SIZE, "cursor": cursor_created_before}
+    else:
+        # No cursor: get newest users who have at least 1 book
+        query = """
+        query GetUsers($limit: Int!) {
+          users(
+            limit: $limit,
+            where: {
+              user_books: {}
+            },
+            order_by: {created_at: desc}
+          ) {
+            id
+            name
+            username
+            bio
+            image { url }
+            created_at
+            updated_at
+            user_books_aggregate {
+              aggregate { count }
+            }
+          }
+        }
+        """
+        variables = {"limit": BATCH_SIZE}
 
     payload = {
         "query": query,
-        "variables": {"limit": BATCH_SIZE, "offset": offset}
+        "variables": variables
     }
 
     headers = {
@@ -174,28 +236,66 @@ def fetch_user_books(user_id):
 
 
 # ============================================================================
-# PHASE 3: Update inverted JSON (books -> users) - INCREMENTAL
+# PHASE 3: Update SQLite database (books -> users) - INCREMENTAL
 # ============================================================================
 
-def update_books_users_json(existing_books_list, new_user_books_data):
+def get_db_connection():
+    """Get a connection to the SQLite database, creating schema if needed."""
+    conn = sqlite3.connect(BOOKS_USERS_DB)
+
+    # Create schema if it doesn't exist
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS books (
+            id INTEGER PRIMARY KEY,
+            title TEXT,
+            slug TEXT,
+            image_url TEXT,
+            cached_contributors TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS book_users (
+            book_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            name TEXT,
+            status TEXT,
+            status_id INTEGER,
+            rating REAL,
+            review_raw TEXT,
+            PRIMARY KEY (book_id, user_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_book_users_user ON book_users(user_id)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_book_users_book ON book_users(book_id)
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.commit()
+
+    return conn
+
+
+def update_books_users_db(conn, new_user_books_data):
     """
-    Update inverted structure with NEW users only (incremental).
+    Update SQLite database with NEW users only (incremental).
 
     Args:
-        existing_books_list: Existing books from books_users.json
-        new_user_books_data: Only the NEW 25 users from this batch
+        conn: SQLite connection
+        new_user_books_data: Only the NEW users from this batch
 
     Returns:
-        Updated books list
+        Tuple of (total_books, total_relationships)
     """
-    # Convert existing list to dict for efficient merging
-    books_dict = {}
-    for book_entry in existing_books_list:
-        book_id = book_entry["book"]["id"]
-        books_dict[book_id] = {
-            "book": book_entry["book"],
-            "users": book_entry["users"]
-        }
+    cursor = conn.cursor()
 
     STATUS_NAMES = {
         1: "want_to_read",
@@ -222,53 +322,68 @@ def update_books_users_json(existing_books_list, new_user_books_data):
 
                 book_id = book["id"]
 
-                # Create book entry if it doesn't exist
-                if book_id not in books_dict:
-                    books_dict[book_id] = {
-                        "book": {
-                            "id": book_id,
-                            "title": book.get("title"),
-                            "slug": book.get("slug"),
-                            "image": book.get("image"),
-                            "cached_contributors": book.get("cached_contributors")
-                        },
-                        "users": []
-                    }
+                # Insert or update book
+                image = book.get("image")
+                image_url = image.get("url") if image else None
+                cached_contrib = book.get("cached_contributors")
 
-                # Add this user to the book
-                books_dict[book_id]["users"].append({
-                    "user_id": user_info["id"],
-                    "username": user_info["username"],
-                    "name": user_info["name"],
-                    "status": status_name,
-                    "status_id": status_id,
-                    "rating": book_entry.get("rating"),
-                    "review_raw": book_entry.get("review_raw")
-                })
+                cursor.execute("""
+                    INSERT OR REPLACE INTO books (id, title, slug, image_url, cached_contributors)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    book_id,
+                    book.get("title"),
+                    book.get("slug"),
+                    image_url,
+                    json.dumps(cached_contrib) if cached_contrib else None
+                ))
 
-    # Convert to list and sort by popularity
-    books_list = []
-    for book_id, book_data in books_dict.items():
-        books_list.append({
-            "book": book_data["book"],
-            "users": book_data["users"],
-            "user_count": len(book_data["users"])
-        })
+                # Insert book-user relationship
+                cursor.execute("""
+                    INSERT OR REPLACE INTO book_users
+                    (book_id, user_id, username, name, status, status_id, rating, review_raw)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    book_id,
+                    user_info["id"],
+                    user_info["username"],
+                    user_info["name"],
+                    status_name,
+                    status_id,
+                    book_entry.get("rating"),
+                    book_entry.get("review_raw")
+                ))
 
-    books_list.sort(key=lambda x: x["user_count"], reverse=True)
+    conn.commit()
 
-    return books_list
+    # Get counts
+    cursor.execute("SELECT COUNT(*) FROM books")
+    total_books = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM book_users")
+    total_relationships = cursor.fetchone()[0]
+
+    return total_books, total_relationships
 
 
 # ============================================================================
 # PHASE 4: Calculate and print statistics
 # ============================================================================
 
-def print_statistics(books_list, user_books_data):
-    """Print required statistics."""
-    # a) Percentage of books with more than one user
-    total_books = len(books_list)
-    books_with_multiple_users = sum(1 for b in books_list if b["user_count"] > 1)
+def print_statistics(conn):
+    """Print required statistics using SQLite database."""
+    cursor = conn.cursor()
+
+    # a) Percentage of books with more than 5 users
+    cursor.execute("SELECT COUNT(*) FROM books")
+    total_books = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COUNT(*) FROM (
+            SELECT book_id FROM book_users GROUP BY book_id HAVING COUNT(*) > 5
+        )
+    """)
+    books_with_multiple_users = cursor.fetchone()[0]
 
     if total_books > 0:
         percentage = (books_with_multiple_users / total_books) * 100
@@ -276,14 +391,11 @@ def print_statistics(books_list, user_books_data):
         percentage = 0
 
     # b) Average number of books per user
-    total_users = len(user_books_data)
-    total_book_entries = sum(
-        len(u.get("books", {}).get("read", [])) +
-        len(u.get("books", {}).get("currently_reading", [])) +
-        len(u.get("books", {}).get("want_to_read", [])) +
-        len(u.get("books", {}).get("other", []))
-        for u in user_books_data
-    )
+    cursor.execute("SELECT COUNT(DISTINCT user_id) FROM book_users")
+    total_users = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM book_users")
+    total_book_entries = cursor.fetchone()[0]
 
     if total_users > 0:
         avg_books = total_book_entries / total_users
@@ -293,7 +405,7 @@ def print_statistics(books_list, user_books_data):
     print(f"\n{'='*60}")
     print(f"STATISTICS")
     print(f"{'='*60}")
-    print(f"a) Books with >1 user: {percentage:.1f}% ({books_with_multiple_users}/{total_books})")
+    print(f"a) Books with >5 users: {percentage:.1f}% ({books_with_multiple_users}/{total_books})")
     print(f"b) Average books per user: {avg_books:.1f}")
     print(f"c) Number of users processed: {total_users}")
     print(f"d) Number of books: {total_books}")
@@ -314,115 +426,159 @@ def main():
     # Load progress
     progress = load_progress()
     batch_num = progress["batches_processed"] + 1
-    offset = progress["batches_processed"] * BATCH_SIZE
+    cursor = progress.get("cursor_created_before")
+    seen_ids = progress.get("seen_user_ids_set", set())
 
     print(f"\n{'='*60}")
     print(f"PROCESSING BATCH #{batch_num}")
     print(f"{'='*60}")
     print(f"Batches already processed: {progress['batches_processed']}")
-    print(f"Total users so far: {progress['total_users']}")
+    print(f"Total unique users so far: {len(seen_ids)}")
+    if cursor:
+        print(f"Cursor: fetching users created before {cursor}")
+    else:
+        print(f"Cursor: None (fetching newest users)")
     print(f"{'='*60}\n")
 
     # ========================================================================
-    # PHASE 1: Download 25 users
+    # PHASE 1: Download 25 users (with duplicate detection)
     # ========================================================================
-    print(f"PHASE 1: Downloading 25 users (offset {offset})...")
+    print(f"PHASE 1: Downloading users (cursor-based)...")
     try:
-        new_users = fetch_users(offset)
-        if not new_users:
+        fetched_users = fetch_users(cursor)
+        if not fetched_users:
             print("No more users available!")
             sys.exit(0)
-        print(f"✓ Downloaded {len(new_users)} users\n")
+
+        # Filter out duplicates
+        new_users = [u for u in fetched_users if u['id'] not in seen_ids]
+        duplicates_found = len(fetched_users) - len(new_users)
+
+        if duplicates_found > 0:
+            print(f"  Fetched {len(fetched_users)} users, {duplicates_found} were duplicates")
+
+        if not new_users:
+            print("All fetched users are duplicates! Updating cursor and retrying...")
+            # Update cursor to oldest fetched user to skip past duplicates
+            oldest = min(fetched_users, key=lambda u: u.get('created_at', ''))
+            progress["cursor_created_before"] = oldest.get('created_at')
+            save_progress(progress)
+            print(f"Cursor updated to: {progress['cursor_created_before']}")
+            print("Run the script again to continue.")
+            sys.exit(0)
+
+        # Filter by book count - only keep users with >= MIN_BOOKS_FILTER books
+        def get_book_count(user):
+            agg = user.get('user_books_aggregate', {})
+            return agg.get('aggregate', {}).get('count', 0)
+
+        users_with_enough_books = [u for u in new_users if get_book_count(u) >= MIN_BOOKS_FILTER]
+        skipped_low_books = len(new_users) - len(users_with_enough_books)
+
+        if skipped_low_books > 0:
+            print(f"  Skipped {skipped_low_books} users with < {MIN_BOOKS_FILTER} books")
+
+        print(f"✓ Downloaded {len(new_users)} new users ({len(users_with_enough_books)} with {MIN_BOOKS_FILTER}+ books)\n")
     except Exception as e:
         print(f"✗ Failed: {e}")
         sys.exit(1)
 
-    # Load and update users.json
+    # ========================================================================
+    # PHASE 2: Get books for each user (only for users with enough books)
+    # ========================================================================
+    new_user_books = []
+
+    if not users_with_enough_books:
+        print(f"PHASE 2: No users with {MIN_BOOKS_FILTER}+ books to process\n")
+    else:
+        print(f"PHASE 2: Fetching books for {len(users_with_enough_books)} users...")
+
+        for idx, user in enumerate(users_with_enough_books, 1):
+            print(f"  [{idx}/{len(users_with_enough_books)}] {user['name']} (@{user['username']})...", end=" ")
+
+            books = fetch_user_books(user['id'])
+            counts = {
+                "read": len(books.get("read", [])),
+                "currently_reading": len(books.get("currently_reading", [])),
+                "want_to_read": len(books.get("want_to_read", [])),
+                "other": len(books.get("other", []))
+            }
+            total = sum(counts.values())
+
+            print(f"{total} books ({counts['read']} read)")
+
+            # Only save users with >= MIN_BOOKS_FILTER READ books
+            if counts["read"] >= MIN_BOOKS_FILTER:
+                new_user_books.append({
+                    "user": {
+                        "id": user["id"],
+                        "name": user["name"],
+                        "username": user["username"]
+                    },
+                    "books": books,
+                    "counts": counts
+                })
+            else:
+                print(f"    ^ Skipped (only {counts['read']} read)")
+
+            if idx < len(users_with_enough_books):
+                time.sleep(REQUEST_DELAY)
+
+        print(f"✓ Fetched books for {len(users_with_enough_books)} users, saved {len(new_user_books)} with {MIN_BOOKS_FILTER}+ read\n")
+
+    # Load and update users.json (only users with 20+ READ books)
+    saved_user_ids = {u["user"]["id"] for u in new_user_books}
+    users_to_save = [u for u in users_with_enough_books if u["id"] in saved_user_ids]
     users_data = load_json_file(USERS_FILE, {"metadata": {}, "users": []})
-    users_data["users"].extend(new_users)
+    users_data["users"].extend(users_to_save)
     users_data["metadata"]["count"] = len(users_data["users"])
     save_json_file(USERS_FILE, users_data)
 
     # ========================================================================
-    # PHASE 2: Get books for each user
+    # PHASE 3: Update SQLite database (incremental)
     # ========================================================================
-    print(f"PHASE 2: Fetching books for {len(new_users)} users...")
-    new_user_books = []
+    print(f"PHASE 3: Updating books->users SQLite database (incremental)...")
 
-    for idx, user in enumerate(new_users, 1):
-        print(f"  [{idx}/{len(new_users)}] {user['name']} (@{user['username']})...", end=" ")
+    # Open database connection
+    conn = get_db_connection()
 
-        books = fetch_user_books(user['id'])
-        counts = {
-            "read": len(books.get("read", [])),
-            "currently_reading": len(books.get("currently_reading", [])),
-            "want_to_read": len(books.get("want_to_read", [])),
-            "other": len(books.get("other", []))
-        }
-        total = sum(counts.values())
+    # Update with ONLY the new users
+    total_books, total_relationships = update_books_users_db(conn, new_user_books)
 
-        print(f"{total} books")
-
-        new_user_books.append({
-            "user": {
-                "id": user["id"],
-                "name": user["name"],
-                "username": user["username"]
-            },
-            "books": books,
-            "counts": counts
-        })
-
-        if idx < len(new_users):
-            time.sleep(REQUEST_DELAY)
-
-    print(f"✓ Fetched books for all users\n")
-
-    # Load and update user_books.json
-    user_books_data = load_json_file(USER_BOOKS_FILE, {"metadata": {}, "user_books": []})
-    user_books_data["user_books"].extend(new_user_books)
-    user_books_data["metadata"]["total_users"] = len(user_books_data["user_books"])
-    save_json_file(USER_BOOKS_FILE, user_books_data)
-
-    # ========================================================================
-    # PHASE 3: Update inverted JSON (incremental)
-    # ========================================================================
-    print(f"PHASE 3: Updating books->users JSON (incremental)...")
-
-    # Load existing books_users.json
-    existing_books_data = load_json_file(BOOKS_USERS_FILE, {"metadata": {}, "books": []})
-    existing_books_list = existing_books_data.get("books", [])
-
-    # Update with ONLY the new 25 users
-    books_list = update_books_users_json(existing_books_list, new_user_books)
-
-    books_users_data = {
-        "metadata": {
-            "created_at": datetime.now(UTC).isoformat(),
-            "total_books": len(books_list),
-            "total_users": len(user_books_data["user_books"])
-        },
-        "books": books_list
-    }
-
-    save_json_file(BOOKS_USERS_FILE, books_users_data)
-    print(f"✓ Updated books_users.json with {len(books_list)} books\n")
+    print(f"✓ Updated books_users.db with {total_books} books\n")
 
     # ========================================================================
     # PHASE 4: Print statistics
     # ========================================================================
     print(f"PHASE 4: Calculating statistics...")
-    print_statistics(books_list, user_books_data["user_books"])
+    print_statistics(conn)
+
+    # Close database connection
+    conn.close()
 
     # ========================================================================
     # UPDATE PROGRESS - Only after all 4 phases complete
     # ========================================================================
+    # Add new user IDs to seen set
+    new_user_ids = [u['id'] for u in new_users]
+    progress["seen_user_ids"].extend(new_user_ids)
+    progress["seen_user_ids_set"].update(new_user_ids)
+
+    # Update cursor to oldest user in this batch (for next batch)
+    oldest_user = min(new_users, key=lambda u: u.get('created_at', ''))
+    progress["cursor_created_before"] = oldest_user.get('created_at')
+
     progress["batches_processed"] = batch_num
-    progress["total_users"] = len(users_data["users"])
-    progress["total_books"] = len(books_list)
+    progress["total_users"] = len(progress["seen_user_ids"])
+    progress["total_books"] = total_books
     save_progress(progress)
 
     print(f"✓ Progress updated: Batch #{batch_num} complete")
+    print(f"  - Scanned {len(new_user_ids)} users, {len(users_with_enough_books)} had {MIN_BOOKS_FILTER}+ total books")
+    print(f"  - Saved {len(new_user_books)} users with {MIN_BOOKS_FILTER}+ READ books")
+    print(f"  - Total users scanned: {progress['total_users']}")
+    print(f"  - Total active users saved: {len(users_data['users'])}")
+    print(f"  - Next cursor: {progress['cursor_created_before']}")
     print(f"\nRun this script again to process the next batch.\n")
 
 

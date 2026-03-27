@@ -1,13 +1,27 @@
-# Google Cloud Run Deployment Guide
+# Book Friend Finder - Deployment Guide
 
-Complete step-by-step guide to deploy the Book Friend Finder app to Google Cloud Run.
+Complete guide to deploy the Book Friend Finder app, optimized for Google Cloud Run.
+
+## Why Pre-Computed Recommendations?
+
+This deployment uses pre-computed recommendations instead of running ML on the server:
+
+| Metric | ML on Server | Pre-Computed |
+|--------|-------------|--------------|
+| Startup time | 30 seconds | <1 second |
+| Memory needed | 1GB | 128MB |
+| Container size | ~1GB | ~100MB |
+| Dependencies | TF+NumPy+sklearn | Flask only |
+| Response time | <100ms | <50ms |
+| Cold start | 30 seconds | 1 second |
+| Cost (always-on) | ~$15/mo | ~$5/mo |
 
 ## Prerequisites
 
 - Google account (Gmail)
 - Credit card (required for Google Cloud, but free tier is generous)
 - Terminal access
-- Your pre-computed data files already generated
+- Pre-computed data files generated locally
 
 ## Part 1: Google Cloud Account Setup
 
@@ -92,20 +106,35 @@ gcloud config set run/region us-central1
 
 ## Part 3: Prepare Your Application
 
-### Step 6: Verify Your Files
+### Step 6: Pre-compute Recommendations
 
-Navigate to your hardcover-live directory:
+Run this on your local machine (where you have TensorFlow):
+
 ```bash
 cd /Users/robin/git/hardcover-live
+python3 precompute_all.py
 ```
 
+This will:
+- Load your data from `~/data/hardcover/`
+- Train the TensorFlow model
+- Generate recommendations for all users
+- Save to `webapp/data/`:
+  - `recommendations.json` (~5-10MB)
+  - `users.json` (~100KB)
+  - `clusters.json` (~50KB)
+
+**Time:** ~30-40 seconds
+
+### Step 7: Verify Your Files
+
 **Required files checklist:**
-- ✅ `webapp/app.py` - Flask application
-- ✅ `webapp/requirements.txt` - Python dependencies
-- ✅ `webapp/templates/` - HTML templates
-- ✅ `webapp/data/recommendations.json` - Pre-computed data
-- ✅ `webapp/data/users.json` - User list
-- ✅ `webapp/data/clusters.json` - Cluster info
+- `webapp/app.py` - Flask application
+- `webapp/requirements.txt` - Python dependencies
+- `webapp/templates/` - HTML templates
+- `webapp/data/recommendations.json` - Pre-computed data
+- `webapp/data/users.json` - User list
+- `webapp/data/clusters.json` - Cluster info
 
 Verify data files exist:
 ```bash
@@ -116,7 +145,15 @@ ls -lh webapp/data/
 # clusters.json (~26KB)
 ```
 
-### Step 7: Create Dockerfile (Optional but Recommended)
+### Step 8: Test Locally
+
+```bash
+cd webapp
+python3 app.py
+# Open http://localhost:8000 - should start instantly!
+```
+
+### Step 9: Create Dockerfile (Optional but Recommended)
 
 Cloud Run can auto-detect Python apps, but a Dockerfile gives you more control:
 
@@ -143,7 +180,7 @@ CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 app:app
 EOF
 ```
 
-### Step 8: Create .gcloudignore
+### Step 10: Create .gcloudignore
 
 Prevent unnecessary files from being uploaded:
 
@@ -167,7 +204,7 @@ EOF
 
 ## Part 4: Deploy to Cloud Run
 
-### Step 9: Initial Deployment
+### Step 11: Initial Deployment
 
 From the `hardcover-live` directory:
 
@@ -201,7 +238,20 @@ gcloud run deploy book-friend-finder \
 3. Deploys to Cloud Run (~1 minute)
 4. **Total time: 4-6 minutes**
 
-### Step 10: Get Your URL
+**Optional: Keep 1 instance warm (no cold starts):**
+
+```bash
+gcloud run deploy book-friend-finder \
+  --source ./webapp \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --memory 512Mi \
+  --min-instances 1
+```
+
+Cost: ~$7/month for always-on instance.
+
+### Step 12: Get Your URL
 
 After deployment completes, you'll see:
 
@@ -212,7 +262,7 @@ Service URL: https://book-friend-finder-xxxxx-uc.a.run.app
 
 **Copy this URL!** This is your live application.
 
-### Step 11: Test Your Deployment
+### Step 13: Test Your Deployment
 
 Open the Service URL in your browser:
 ```bash
@@ -227,8 +277,6 @@ Test the app:
 4. Click "View Full Cluster" to test cluster page
 
 ## Part 5: Updating Your App
-
-### Step 12: Update Pre-Computed Data
 
 When you have new data (more users, updated recommendations):
 
@@ -255,7 +303,7 @@ The deployment automatically:
 
 ## Part 6: Monitoring and Management
 
-### Step 13: View Logs
+### View Logs
 
 ```bash
 # Stream live logs
@@ -266,7 +314,7 @@ gcloud run services logs tail book-friend-finder --region us-central1
 # Click your service → Logs tab
 ```
 
-### Step 14: Check Metrics
+### Check Metrics
 
 1. Go to https://console.cloud.google.com/run
 2. Click **"book-friend-finder"**
@@ -277,7 +325,7 @@ gcloud run services logs tail book-friend-finder --region us-central1
    - Error rate
    - Container CPU/memory usage
 
-### Step 15: Manage Revisions
+### Manage Revisions
 
 ```bash
 # List all revisions
@@ -334,8 +382,6 @@ gcloud run services update book-friend-finder \
 
 ## Part 8: Custom Domain (Optional)
 
-### Step 16: Add Custom Domain
-
 If you own a domain (e.g., `bookfriends.com`):
 
 1. Go to https://console.cloud.google.com/run
@@ -348,7 +394,25 @@ If you own a domain (e.g., `bookfriends.com`):
 
 Cloud Run provides free SSL certificates automatically.
 
-## Part 9: Troubleshooting
+## Part 9: Alternative Deployment Options
+
+While Cloud Run is recommended, here are other options:
+
+### Railway
+- Simple git-based deployment
+- Free tier available
+- `railway up`
+
+### Render
+- Free tier
+- Auto-deploys from GitHub
+- `render.yaml` config
+
+### Heroku
+- Classic PaaS
+- `git push heroku main`
+
+## Part 10: Troubleshooting
 
 ### Common Issues
 
@@ -394,17 +458,18 @@ gcloud run services update book-friend-finder \
   --region us-central1
 ```
 
-### Debug Locally First
+**Issue: recommendations.json not found**
+- Run `python3 precompute_all.py` first
 
-Before deploying, always test locally:
-```bash
-cd /Users/robin/git/hardcover-live/webapp
-python3 app.py
-# Open http://localhost:8000
-# Test all features
-```
+**Issue: App starts but shows no users**
+- Check that `webapp/data/*.json` files exist
+- Verify files were generated correctly
 
-## Part 10: Security Best Practices
+**Issue: Users list is empty**
+- Re-run `python3 precompute_all.py`
+- Check ~/data/hardcover/ has valid data
+
+## Part 11: Security Best Practices
 
 ### Environment Variables
 
@@ -468,26 +533,15 @@ gcloud run services update book-friend-finder --max-instances 5 --region us-cent
 
 ## Success Checklist
 
-- ✅ Google Cloud account created
-- ✅ Billing enabled (credit card added)
-- ✅ Project created and APIs enabled
-- ✅ gcloud CLI installed and authenticated
-- ✅ Pre-computed data files generated
-- ✅ Successfully deployed to Cloud Run
-- ✅ Tested live URL
-- ✅ Budget alerts configured
-- ✅ Monitoring set up
-
-## Next Steps
-
-1. Share your live URL with friends
-2. Monitor usage in Cloud Console
-3. Update recommendations weekly/monthly
-4. Consider adding features:
-   - User feedback mechanism
-   - Book cover images
-   - Reading statistics
-   - Email notifications for new matches
+- [ ] Google Cloud account created
+- [ ] Billing enabled (credit card added)
+- [ ] Project created and APIs enabled
+- [ ] gcloud CLI installed and authenticated
+- [ ] Pre-computed data files generated
+- [ ] Successfully deployed to Cloud Run
+- [ ] Tested live URL
+- [ ] Budget alerts configured
+- [ ] Monitoring set up
 
 ## Support
 

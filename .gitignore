@@ -1,3 +1,37 @@
 .env
 *.pyc
 __pycache__/
+
+# macOS
+.DS_Store
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc
+
+# Local data/config
+book_progress.json
+cloud-config.txt
+firebase-debug.log
+firebase.json
+
+# Internal docs
+CLAUDE_DOCS/
+pdf/
+
+# Backup files
+*.backup
+
+# Large generated data (regenerate with precompute_all.py)
+webapp/data/recommendations.json
+webapp/data/chat.db
+
+# Batch processing state
+progress.json
+
+# Claude Code config
+.claude/

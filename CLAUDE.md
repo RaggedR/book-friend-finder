@@ -43,12 +43,12 @@ scripts/process_batch.py (25 users/batch, 1s delay between API calls)
 ├── user_books.json    (users → books, ~100MB+)
 └── books_users.json   (books → users inverted index, ~60MB+)
          ↓
-precompute_all.py (TensorFlow matrix factorization + K-means clustering)
+precompute_all.py (TensorFlow BPR matrix factorization)
          ↓
 webapp/data/
 ├── recommendations.json (pre-computed friend matches)
-├── users.json          (filtered active users)
-└── clusters.json       (cluster membership)
+├── users.json            (filtered active users)
+└── chat.db              (SQLite message storage)
          ↓
 webapp/app.py (Flask, no ML deps at runtime)
 ```
@@ -57,26 +57,42 @@ webapp/app.py (Flask, no ML deps at runtime)
 
 - **Offline ML**: All TensorFlow training happens locally via `precompute_all.py`. The webapp only serves pre-computed JSON - no ML libraries needed in production.
 - **Atomic batch processing**: `scripts/process_batch.py` saves progress only after all 4 phases complete (fetch users → fetch books → update inverted index → stats). Safe to interrupt mid-batch.
-- **Chat access control**: Users can only message their top 10 matches (enforced in `webapp/app.py:chat_conversation`, lines 211-214).
+- **Chat access control**: Users can only message their top 10 matches or people who messaged them first (enforced in `webapp/app.py:chat_conversation`, lines 150-153).
 - **SQLite chat storage**: `webapp/chat_db.py` stores messages in `webapp/data/chat.db`.
 - **Progress tracking**: `progress.json` in repo root tracks batches processed. After forced shutdowns, verify all files are consistent (users.json, user_books.json, books_users.json counts should match). If corrupted, `scripts/invert_to_books.py` can rebuild books_users.json from user_books.json.
 
 ### Recommendation Algorithm
 
-Matrix factorization with implicit feedback weights:
-- Read (rating ≥3 or no rating): 1.0
+**BPR (Bayesian Personalized Ranking)** is the default training method. It treats recommendation as a ranking problem rather than classification, which handles the severe class imbalance (95% positive ratings) better than pointwise loss. BPR doubles precision compared to the old pointwise method.
+
+Implicit feedback weights:
+- Read with rating: rating/5.0 (e.g., 5-star = 1.0, 3-star = 0.6)
+- Read without rating: 0.7
 - Currently reading: 0.7
 - Want to read: 0.3
 - Did not finish: 0.0
 
-Friend matching uses cosine similarity on L2-normalized user feature vectors, grouped by K-means clusters.
+Friend matching uses cosine similarity on L2-normalized user feature vectors against ALL users (no clustering). See IMPLEMENTATION.md for the full algorithm details and evaluation results.
 
 **Tunable constants in `precompute_all.py`:**
+- `USE_BPR = True` - Use BPR loss (default, 2x better precision). Set False for old pointwise loss.
 - `MIN_RATINGS_PER_USER = 20`, `MIN_USERS_PER_BOOK = 5` (data filtering)
-- `NUM_FEATURES = 20` (latent dimensions)
-- `NUM_CLUSTERS = 15` (K-means)
+- `MAX_BOOK_POPULARITY_PCT = 0.10` - Drop books read by >10% of users. **Improves hit rate ratio by 97%**
+- `NUM_FEATURES = 30` (latent dimensions, tuned)
 - `LAMBDA = 1.0` (L2 regularization)
-- `ITERATIONS = 300`, `LEARNING_RATE = 0.1`
+- `ITERATIONS = 100`, `LEARNING_RATE = 0.1`
+- `NEG_SAMPLES_PER_POS = 4` (BPR negative sampling ratio)
+
+**Evaluation scripts:**
+- `evaluate_recommendations.py` - Original pointwise evaluation (Precision@K, Recall@K, NDCG)
+- `evaluate_bpr.py` - BPR vs Pointwise book recommendation comparison. **BPR doubles precision**
+- `evaluate_friend_quality.py` - Friend-finding quality using IDF-weighted agreement
+- `evaluate_idf_training.py` - Tests IDF-weighted training. **Does not help**
+- `evaluate_predictive.py` - Predictive friend quality: do friends predict held-out books? **BPR is best (3x hit rate)**
+- `evaluate_popularity_filter.py` - Tests popular book filtering. **10% threshold doubles hit rate ratio**
+- `evaluate_hyperparams.py` - Tests NUM_FEATURES. **30 features optimal**
+
+See IMPLEMENTATION.md for full results and analysis.
 
 ## API Configuration
 
@@ -94,7 +110,6 @@ Get token: https://hardcover.app/account/api
 |-------|--------|---------|
 | `/` | GET | User selection |
 | `/find_friends` | POST | Get friend recommendations |
-| `/cluster/<id>` | GET | View cluster members |
 | `/chat` | GET | Chat inbox |
 | `/chat/<other_id>` | GET/POST | Conversation (top 10 matches only) |
 | `/chat/<other_id>/messages` | GET | Poll for new messages (JSON) |
@@ -102,10 +117,7 @@ Get token: https://hardcover.app/account/api
 
 ## Production
 
-**URL:** https://book-friend-finder-770103525576.us-central1.run.app
+**URL:** https://book-friend-finder-i2nrrpteiq-uc.a.run.app
 
 See `DEPLOYMENT.md` for full Cloud Run setup guide.
 
-## Legacy Scripts
-
-Do not use `scripts/fetch_users.py`, `fetch_user_books.py`, `append_users.py`, `invert_to_books.py` - superseded by `process_batch.py` (conflicting progress tracking).

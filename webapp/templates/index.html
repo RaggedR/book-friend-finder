@@ -254,19 +254,13 @@
             </button>
         </form>
 
-        <button type="button" onclick="goToBookClub()" style="margin-top: 15px;">
-            <span class="emoji">📖</span> Book Club
-        </button>
-
         <div id="messages-link" class="messages-link">
             <a href="#" id="view-messages" onclick="return checkUserSelected()">💬 Messages <span id="message-badge" style="display:none; background:#667eea; color:white; border-radius:10px; padding:2px 6px; font-size:0.8em; margin-left:3px;"></span></a>
-            <span style="margin: 0 10px; color: #ccc;">|</span>
-            <a href="#" id="my-groups-link" onclick="return goToMyGroups()">👥 My Book Clubs</a>
         </div>
 
         <div class="footer">
-            <p>Powered by collaborative filtering & ML clustering</p>
-            <p>{{ users|length }} active readers • 8.83% precision</p>
+            <p>Powered by collaborative filtering</p>
+            <p>{{ users|length }} active readers</p>
         </div>
     </div>
 
@@ -394,26 +388,6 @@
                 return false;
             }
             return true;
-        }
-
-        function goToBookClub() {
-            if (!userIdInput.value) {
-                alert('Please select your name first');
-                searchInput.focus();
-                return false;
-            }
-            window.location.href = '/book_club?user_id=' + userIdInput.value;
-            return false;
-        }
-
-        function goToMyGroups() {
-            if (!userIdInput.value) {
-                alert('Please select your name first');
-                searchInput.focus();
-                return false;
-            }
-            window.location.href = '/my_groups?user_id=' + userIdInput.value;
-            return false;
         }
 
         // Check for unread messages when user is selected

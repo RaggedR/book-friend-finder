@@ -15,7 +15,11 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 import os
+import sys
 from collections import defaultdict
+
+# Force unbuffered output
+print = lambda *args, **kwargs: __builtins__.print(*args, **kwargs, flush=True)
 
 # Configuration
 DATA_DIR = os.path.expanduser("~/data/hardcover/")
@@ -23,9 +27,9 @@ BOOKS_USERS_FILE = os.path.join(DATA_DIR, "books_users.json")
 USER_BOOKS_FILE = os.path.join(DATA_DIR, "user_books.json")
 
 MIN_USERS_PER_BOOK = 2
-NUM_FEATURES = 5
-LAMBDA = 5
-ITERATIONS = 200
+NUM_FEATURES = 20
+LAMBDA = 1.0
+ITERATIONS = 50
 LEARNING_RATE = 0.1
 RANDOM_SEED = 42
 
@@ -96,18 +100,11 @@ print(f"  Total ratings: {total_ratings:,}")
 print("\n[3/7] Creating 80/20 train/test split...")
 
 def decompose_matrix_80_20(R, random_seed=RANDOM_SEED):
-    R = np.array(R)
-    A = np.zeros_like(R)
-    B = np.zeros_like(R)
+    """Vectorized 80/20 split - much faster than nested loops."""
     np.random.seed(random_seed)
-
-    for i in range(R.shape[0]):
-        for j in range(R.shape[1]):
-            if R[i, j] == 1:
-                if np.random.rand() < 0.8:
-                    A[i, j] = 1
-                else:
-                    B[i, j] = 1
+    mask = np.random.rand(*R.shape) < 0.8
+    A = R * mask
+    B = R * (~mask)
     return A, B
 
 def replace_with_half(Y, R):
@@ -194,15 +191,22 @@ print(f"   Test accuracy: {test_accuracy*100:.2f}%")
 print(f"   (Baseline: 95% - always predict 'like')")
 
 # 2. PRECISION@K and RECALL@K
-def precision_recall_at_k(probabilities, Y_test, R_test, k_values=[5, 10, 20]):
+SAMPLE_USERS = 1000  # Sample users for faster evaluation
+
+def precision_recall_at_k(probabilities, Y_test, R_test, k_values=[5, 10, 20], sample_size=SAMPLE_USERS):
     """
     For each user, recommend top K books and measure:
     - Precision@K: % of top K that user actually liked
     - Recall@K: % of user's liked books that appear in top K
+    Uses sampling for speed.
     """
     results = {k: {'precision': [], 'recall': []} for k in k_values}
 
-    for user_idx in range(num_users):
+    # Sample users for faster evaluation
+    np.random.seed(RANDOM_SEED)
+    user_indices = np.random.choice(num_users, min(sample_size, num_users), replace=False)
+
+    for user_idx in user_indices:
         # Get user's test set likes
         user_test_mask = R_test[:, user_idx] == 1
         user_test_likes = np.where((Y_test[:, user_idx] == 1) & user_test_mask)[0]
@@ -217,12 +221,13 @@ def precision_recall_at_k(probabilities, Y_test, R_test, k_values=[5, 10, 20]):
         user_probs_masked = user_probs.copy()
         user_probs_masked[user_train_mask] = -1  # Exclude training books
 
-        for k in k_values:
-            # Get top K recommendations
-            top_k_indices = np.argsort(-user_probs_masked)[:k]
+        max_k = max(k_values)
+        top_k_indices = np.argpartition(-user_probs_masked, max_k)[:max_k]
+        top_k_indices = top_k_indices[np.argsort(-user_probs_masked[top_k_indices])]
 
+        for k in k_values:
             # Precision: % of top K that are in test likes
-            hits = len(set(top_k_indices) & set(user_test_likes))
+            hits = len(set(top_k_indices[:k]) & set(user_test_likes))
             precision = hits / k
             results[k]['precision'].append(precision)
 
@@ -250,41 +255,37 @@ for k, metrics in pr_metrics.items():
     print(f"     Recall@{k}: {metrics['recall']*100:.2f}% (% of user's likes in top {k})")
 
 # 3. NDCG (Normalized Discounted Cumulative Gain)
-def ndcg_at_k(probabilities, Y_test, R_test, k=10):
+def ndcg_at_k(probabilities, Y_test, R_test, k=10, sample_size=SAMPLE_USERS):
     """
     Measures ranking quality - higher score = better ranking
-    Considers both order and relevance
+    Uses sampling for speed.
     """
     ndcg_scores = []
+    np.random.seed(RANDOM_SEED + 1)  # Different seed for variety
+    user_indices = np.random.choice(num_users, min(sample_size, num_users), replace=False)
 
-    for user_idx in range(num_users):
+    for user_idx in user_indices:
         user_test_mask = R_test[:, user_idx] == 1
         if np.sum(user_test_mask) == 0:
             continue
 
-        # Get relevance scores (actual likes/dislikes)
         relevance = Y_test[:, user_idx].copy()
-
-        # Get predicted probabilities (exclude training items)
         user_probs = probabilities[:, user_idx].copy()
         user_train_mask = R_train[:, user_idx] == 1
         user_probs[user_train_mask] = -1
 
-        # Get top K by prediction
-        top_k_indices = np.argsort(-user_probs)[:k]
+        top_k_indices = np.argpartition(-user_probs, k)[:k]
+        top_k_indices = top_k_indices[np.argsort(-user_probs[top_k_indices])]
 
-        # DCG: sum of (relevance / log2(rank+1))
         dcg = 0
         for rank, book_idx in enumerate(top_k_indices, 1):
-            if user_test_mask[book_idx]:  # Only count if in test set
+            if user_test_mask[book_idx]:
                 dcg += relevance[book_idx] / np.log2(rank + 1)
 
-        # IDCG: ideal DCG (perfect ranking)
         test_relevances = relevance[user_test_mask]
         sorted_relevances = np.sort(test_relevances)[::-1][:k]
         idcg = sum(rel / np.log2(rank + 1) for rank, rel in enumerate(sorted_relevances, 1))
 
-        # NDCG
         if idcg > 0:
             ndcg_scores.append(dcg / idcg)
 

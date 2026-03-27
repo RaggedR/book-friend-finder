@@ -1,9 +1,0 @@
-\beamer@sectionintoc {1}{Introduction}{3}{0}{1}
-\beamer@sectionintoc {2}{Data Preparation}{4}{0}{2}
-\beamer@sectionintoc {3}{Matrix Factorization}{6}{0}{3}
-\beamer@sectionintoc {4}{Handling Sparsity}{9}{0}{4}
-\beamer@sectionintoc {5}{Training}{11}{0}{5}
-\beamer@sectionintoc {6}{Results}{13}{0}{6}
-\beamer@sectionintoc {7}{Comparison}{15}{0}{7}
-\beamer@sectionintoc {8}{Friend Matching}{16}{0}{8}
-\beamer@sectionintoc {9}{Conclusion}{19}{0}{9}

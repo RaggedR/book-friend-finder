@@ -2,7 +2,7 @@
 
 A book recommendation system that helps readers find their "book friends" - people with similar reading tastes. Uses the [Hardcover](https://hardcover.app) API for data and BPR matrix factorization (TensorFlow) for collaborative filtering.
 
-**Live demo:** https://book-friend-finder-i2nrrpteiq-uc.a.run.app
+**Live demo:** https://book-friend-finder-954510692982.us-central1.run.app
 
 ## Features
 
